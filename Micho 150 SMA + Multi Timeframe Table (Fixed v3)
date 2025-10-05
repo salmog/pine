@@ -1,0 +1,193 @@
+//@version=5
+indicator("Micho 150 SMA + Multi Timeframe Table (Fixed v3)", overlay=true, max_labels_count=500)
+
+//==============================================================
+// [1] USER INPUTS
+//==============================================================
+showSMA          = input.bool(true,  title="Show SMA 150 Line")
+showStopLoss     = input.bool(true,  title="Show Stop Loss Line")
+showCheckBuy     = input.bool(true,  title="Show Check Buy Option Line")
+showLabels       = input.bool(true,  title="Show Entry/Sell Labels")
+stopLossPercent  = input.float(1,    title="Stop Loss Percentage (%)", minval=0.1, maxval=10, step=0.1)
+checkBuyPercent  = input.float(1,    title="Check Buy Option Percentage (%)", minval=0.1, maxval=10, step=0.1)
+
+//==============================================================
+// [2] MOVING AVERAGES + SUPPORT LINES
+//==============================================================
+sma150        = ta.sma(close, 150)
+stopLossPrice = sma150 * (1 - stopLossPercent / 100)
+checkBuyPrice = sma150 * (1 + checkBuyPercent / 100)
+
+plot(showSMA      ? sma150       : na, color=color.gray, linewidth=2, title="SMA150")
+plot(showStopLoss ? stopLossPrice: na, color=color.red,  linewidth=1, title="Stop Loss")
+plot(showCheckBuy ? checkBuyPrice: na, color=color.green,linewidth=1, title="Check Buy")
+
+//==============================================================
+// [3] LABELS FOR CROSS EVENTS
+//==============================================================
+longCondition  = ta.crossover(close, sma150)
+shortCondition = ta.crossunder(close, sma150)
+
+if showLabels
+    if longCondition
+        label.new(bar_index, high, text="start follow", color=color.new(color.green, 0),
+                  style=label.style_label_up, yloc=yloc.belowbar)
+    if shortCondition
+        label.new(bar_index, low, text="check stoploss", color=color.new(color.red, 0),
+                  style=label.style_label_down, yloc=yloc.abovebar)
+
+//==============================================================
+// [4] TREND CALCULATION FUNCTIONS (FIXED)
+//==============================================================
+robustTrend(swings) =>
+    hh1 = ta.valuewhen(ta.pivothigh(high, swings, swings), high, 0)
+    hh2 = ta.valuewhen(ta.pivothigh(high, swings, swings), high, 1)
+    hh3 = ta.valuewhen(ta.pivothigh(high, swings, swings), high, 2)
+    ll1 = ta.valuewhen(ta.pivotlow(low, swings, swings), low, 0)
+    ll2 = ta.valuewhen(ta.pivotlow(low, swings, swings), low, 1)
+    ll3 = ta.valuewhen(ta.pivotlow(low, swings, swings), low, 2)
+
+    trendDir = "Neutral"
+    if na(hh1) or na(hh2) or na(hh3) or na(ll1) or na(ll2) or na(ll3)
+        trendDir := "Neutral"
+    else
+        if hh1 > hh2 and hh2 > hh3 and ll1 > ll2 and ll2 > ll3
+            trendDir := "Bullish"
+        else if hh1 < hh2 and hh2 < hh3 and ll1 < ll2 and ll2 < ll3
+            trendDir := "Bearish"
+        else
+            trendDir := "Neutral"
+
+    swl = ll1
+    [trendDir, swl]
+
+//--------------------------------------------------------------
+// getAll function
+//--------------------------------------------------------------
+getAll(swings, robust=false) =>
+    string trendDir = ""
+    float swl = na
+
+    // Robust trend
+    if robust
+        [trendDirRobust, swlRobust] = robustTrend(swings)
+        trendDir := trendDirRobust
+        swl := swlRobust
+    else
+        hh     = ta.valuewhen(ta.pivothigh(high, swings, swings), high, 0)
+        prevhh = ta.valuewhen(ta.pivothigh(high, swings, swings), high, 1)
+        ll     = ta.valuewhen(ta.pivotlow(low, swings, swings), low, 0)
+        prevll = ta.valuewhen(ta.pivotlow(low, swings, swings), low, 1)
+
+        if na(hh) or na(prevhh) or na(ll) or na(prevll)
+            trendDir := "Neutral"
+        else if hh > prevhh and ll > prevll
+            trendDir := "Bullish"
+        else if hh < prevhh and ll < prevll
+            trendDir := "Bearish"
+        else
+            trendDir := "Neutral"
+
+        swl := ll
+
+    // MACD
+    [macdLine, macdSignal, _] = ta.macd(close, 12, 26, 9)
+    macd   = macdLine > macdSignal ? "Bullish" : "Bearish"
+
+    // RSI
+    rsi    = ta.rsi(close, 14)
+
+    // Bollinger Bands %
+    basis  = ta.sma(close, 20)
+    dev    = 2 * ta.stdev(close, 20)
+    lower  = basis - dev
+    upper  = basis + dev
+    bbpos  = na(upper - lower) ? na : (close - lower) / (upper - lower) * 100
+
+    // Volume Spike
+    volspk = volume > ta.sma(volume, 20) ? "Yes" : "No"
+
+    // Retest based on last pivot high
+    shigh  = ta.pivothigh(high, swings, swings)
+    sres   = ta.valuewhen(shigh, high, 0)
+    ret    = ta.valuewhen(close > sres and sres != 0, close, 0)
+
+    // Entry price
+    entry = na(ret) ? swl : ret
+
+    [trendDir, swl, macd, rsi, bbpos, volspk, ret, entry]
+
+
+//==============================================================
+// [5] MULTI-TIMEFRAME REQUESTS
+//==============================================================
+[trend4, swl4, macd_4h, rsi_4h, bb_4h, vol_4h, ret_4h, entry4] = request.security(syminfo.tickerid, "240", getAll(3))
+[trendD, swlD, macd_1d, rsi_1d, bb_1d, vol_1d, ret_1d, entryD]   = request.security(syminfo.tickerid, "D",   getAll(3))
+[trendW, swlW, macd_1w, rsi_1w, bb_1w, vol_1w, ret_1w, entryW]   = request.security(syminfo.tickerid, "W",   getAll(5, true))
+[trendM, swlM, macd_1m, rsi_1m, bb_1m, vol_1m, ret_1m, entryM]   = request.security(syminfo.tickerid, "M",   getAll(7))
+
+//==============================================================
+// [6] TABLE CREATION
+//==============================================================
+var table mtfTable = na
+
+if barstate.islastconfirmedhistory
+    if not na(mtfTable)
+        table.delete(mtfTable)
+
+    mtfTable := table.new(position.top_right, 9, 5, bgcolor=color.new(color.blue, 70), frame_width=2, frame_color=color.white)
+
+    // Header
+    table.cell(mtfTable, 0, 0, "TF",       text_color=color.white)
+    table.cell(mtfTable, 1, 0, "Trend",    text_color=color.white)
+    table.cell(mtfTable, 2, 0, "Entry",    text_color=color.white)
+    table.cell(mtfTable, 3, 0, "SW Low",   text_color=color.white)
+    table.cell(mtfTable, 4, 0, "Retest",   text_color=color.white)
+    table.cell(mtfTable, 5, 0, "MACD",     text_color=color.white)
+    table.cell(mtfTable, 6, 0, "RSI",      text_color=color.white)
+    table.cell(mtfTable, 7, 0, "Boll%",    text_color=color.white)
+    table.cell(mtfTable, 8, 0, "VolSpike", text_color=color.white)
+
+    // 4H
+    table.cell(mtfTable, 0, 1, "4H", text_color=color.white)
+    table.cell(mtfTable, 1, 1, trend4, text_color=color.white)
+    table.cell(mtfTable, 2, 1, str.tostring(entry4, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 1, str.tostring(swl4, "#.##"),   text_color=color.white)
+    table.cell(mtfTable, 4, 1, str.tostring(ret_4h, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 5, 1, macd_4h, text_color=color.white)
+    table.cell(mtfTable, 6, 1, str.tostring(rsi_4h, "#"),    text_color=color.white)
+    table.cell(mtfTable, 7, 1, str.tostring(bb_4h, "#"),     text_color=color.white)
+    table.cell(mtfTable, 8, 1, vol_4h, text_color=color.white)
+
+    // 1D
+    table.cell(mtfTable, 0, 2, "1D", text_color=color.white)
+    table.cell(mtfTable, 1, 2, trendD, text_color=color.white)
+    table.cell(mtfTable, 2, 2, str.tostring(entryD, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 2, str.tostring(swlD, "#.##"),   text_color=color.white)
+    table.cell(mtfTable, 4, 2, str.tostring(ret_1d, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 5, 2, macd_1d, text_color=color.white)
+    table.cell(mtfTable, 6, 2, str.tostring(rsi_1d, "#"),    text_color=color.white)
+    table.cell(mtfTable, 7, 2, str.tostring(bb_1d, "#"),     text_color=color.white)
+    table.cell(mtfTable, 8, 2, vol_1d, text_color=color.white)
+
+    // 1W
+    table.cell(mtfTable, 0, 3, "1W", text_color=color.white)
+    table.cell(mtfTable, 1, 3, trendW, text_color=color.white)
+    table.cell(mtfTable, 2, 3, str.tostring(entryW, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 3, str.tostring(swlW, "#.##"),   text_color=color.white)
+    table.cell(mtfTable, 4, 3, str.tostring(ret_1w, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 5, 3, macd_1w, text_color=color.white)
+    table.cell(mtfTable, 6, 3, str.tostring(rsi_1w, "#"),    text_color=color.white)
+    table.cell(mtfTable, 7, 3, str.tostring(bb_1w, "#"),     text_color=color.white)
+    table.cell(mtfTable, 8, 3, vol_1w, text_color=color.white)
+
+    // 1M
+    table.cell(mtfTable, 0, 4, "1M", text_color=color.white)
+    table.cell(mtfTable, 1, 4, trendM, text_color=color.white)
+    table.cell(mtfTable, 2, 4, str.tostring(entryM, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 4, str.tostring(swlM, "#.##"),   text_color=color.white)
+    table.cell(mtfTable, 4, 4, str.tostring(ret_1m, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 5, 4, macd_1m, text_color=color.white)
+    table.cell(mtfTable, 6, 4, str.tostring(rsi_1m, "#"),    text_color=color.white)
+    table.cell(mtfTable, 7, 4, str.tostring(bb_1m, "#"),     text_color=color.white)
+    table.cell(mtfTable, 8, 4, vol_1m, text_color=color.white)
