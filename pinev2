@@ -1,0 +1,345 @@
+//@version=5
+indicator("High-Probability Long Entries: Enhanced Resistance Zones (Fixed)", overlay=true, max_labels_count=500)
+
+//==============================================================
+// [1] USER INPUTS
+//==============================================================
+showSMA = input.bool(true, title="Show SMA 150 Line")
+showLabels = input.bool(true, title="Show Entry Labels")
+swings_input = input.int(5, title="Pivot Swings (Support)", minval=3, maxval=10)
+res_strength = input.int(2, title="Resistance Pivot Strength (Left/Right Bars)", minval=1, maxval=5)
+risk_pct = input.float(1.5, title="Max Risk %", minval=0.5, maxval=2.0, step=0.1)
+tolerance_pct = input.float(1.0, title="Retest Tolerance %", minval=0.1, maxval=2.0, step=0.1)
+res_zone_tol_pct = input.float(1.0, title="Resistance Zone Tolerance %", minval=0.5, maxval=3.0, step=0.1)
+res_window_bars = input.int(80, title="Resistance Rolling Window (Bars)", minval=60, maxval=100)
+pullback_pct = input.float(1.5, title="Pullback Drop % After Resistance Touch", minval=0.5, maxval=3.0, step=0.1)
+pullback_bars = input.int(5, title="Pullback Lookback Bars", minval=3, maxval=10)
+half_life = input.int(20, title="Recency Half-Life for Weighting (Bars)", minval=10, maxval=50)
+
+//==============================================================
+// [2] MOVING AVERAGES
+//==============================================================
+sma150 = ta.sma(close, 150)
+plot(showSMA ? sma150 : na, color=color.new(color.gray, 0), linewidth=2, title="SMA150")
+
+//==============================================================
+// [3] ENHANCED RESISTANCE IDENTIFICATION FUNCTION
+//==============================================================
+getResistance() =>
+    // Running ATH to avoid deep history reference
+    var float ath_level = na
+    ath_level := na(ath_level) ? high : math.max(ath_level, high)
+    
+    // Stronger pivot high: left/right = res_strength (e.g., 2 for 5-bar window: n-2 to n+2)
+    ph = ta.pivothigh(high, res_strength, res_strength)
+    
+    // Collect recent pivot highs in rolling window
+    var array<float> recent_phs = array.new<float>()
+    if not na(ph)
+        array.unshift(recent_phs, ph)
+        if array.size(recent_phs) > res_window_bars
+            array.pop(recent_phs)
+    
+    // Group into zones: cluster highs within tolerance
+    var array<float> zones = array.new<float>()
+    if array.size(recent_phs) > 1
+        array.clear(zones)
+        current_cluster_high = array.get(recent_phs, 0)
+        current_cluster_avg = current_cluster_high
+        cluster_count = 1.0
+        for i = 1 to array.size(recent_phs) - 1
+            candidate_high = array.get(recent_phs, i)
+            tol = res_zone_tol_pct / 100
+            if math.abs(candidate_high - current_cluster_high) / current_cluster_high <= tol
+                // Add to current cluster
+                current_cluster_high := (current_cluster_high * cluster_count + candidate_high) / (cluster_count + 1)
+                cluster_count += 1
+            else
+                // Finalize previous cluster if >=2 highs
+                if cluster_count >= 2
+                    array.push(zones, current_cluster_high)
+                // Start new cluster
+                current_cluster_high := candidate_high
+                cluster_count := 1
+        // Finalize last cluster
+        if cluster_count >= 2
+            array.push(zones, current_cluster_high)
+    
+    // Main resistance: Most recent zone, or latest pivot if no zone (fixed: removed outer na())
+    main_res = array.size(zones) > 0 ? array.get(zones, 0) : na(ph) ? na : ph
+    
+    // Weight recent highs in the most recent zone (exponential decay)
+    weighted_res = main_res
+    if not na(main_res) and array.size(recent_phs) > 0
+        total_weight = 0.0
+        weighted_sum = 0.0
+        for i = 0 to array.size(recent_phs) - 1
+            h = array.get(recent_phs, i)
+            if math.abs(h - main_res) / main_res <= res_zone_tol_pct / 100  // Only in recent zone
+                bars_ago = i  // Approximate recency
+                weight = math.exp(-bars_ago / half_life)
+                weighted_sum += h * weight
+                total_weight += weight
+        weighted_res := total_weight > 0 ? weighted_sum / total_weight : main_res
+    
+    // ATH check (using running ATH)
+    is_ath = not na(weighted_res) and math.abs(weighted_res - ath_level) / ath_level < 0.001  // Near ATH
+    
+    // Pullback detection after resistance touch
+    touch_res = high >= weighted_res * 0.999  // Within 0.1% touch
+    fail_close = close < weighted_res
+    drop_after = touch_res[1] and fail_close and ta.lowest(low, pullback_bars) <= weighted_res * (1 - pullback_pct / 100)
+    pullback_detected = drop_after
+    
+    [weighted_res, is_ath, pullback_detected, zones.size() > 0 ? "Zoned" : "Single"]
+
+//==============================================================
+// [4] TREND CALCULATION FUNCTIONS (ENHANCED WITH RESISTANCE)
+//==============================================================
+getAll(swings, robust=false) =>
+    ph = ta.pivothigh(high, swings, swings)
+    pl = ta.pivotlow(low, swings, swings)
+    last_res_basic = ta.valuewhen(not na(ph), high, 0)
+    swl = ta.valuewhen(not na(pl), low, 0)
+    
+    // Multiple bounces for support zone (≥3 as per previous)
+    prev_pl = ta.valuewhen(not na(pl), low, 1)
+    prev_prev_pl = ta.valuewhen(not na(pl), low, 2)
+    multiple_bounce = not na(swl) and not na(prev_pl) and not na(prev_prev_pl) and 
+                     (math.max(swl, math.max(prev_pl, prev_prev_pl)) - math.min(swl, math.min(prev_pl, prev_prev_pl))) / swl < 0.02
+    
+    string trendDir = "Neutral"
+    
+    if robust
+        hh1 = ta.valuewhen(not na(ph), high, 0)
+        hh2 = ta.valuewhen(not na(ph), high, 1)
+        hh3 = ta.valuewhen(not na(ph), high, 2)
+        ll1 = ta.valuewhen(not na(pl), low, 0)
+        ll2 = ta.valuewhen(not na(pl), low, 1)
+        ll3 = ta.valuewhen(not na(pl), low, 2)
+        
+        if not na(hh1) and not na(hh2) and not na(hh3) and not na(ll1) and not na(ll2) and not na(ll3)
+            if hh1 > hh2 and hh2 > hh3 and ll1 > ll2 and ll2 > ll3
+                trendDir := "Bullish"
+            else if hh1 < hh2 and hh2 < hh3 and ll1 < ll2 and ll2 < ll3
+                trendDir := "Bearish"
+        swl := ll1
+    else
+        hh = ta.valuewhen(not na(ph), high, 0)
+        prevhh = ta.valuewhen(not na(ph), high, 1)
+        ll = ta.valuewhen(not na(pl), low, 0)
+        prevll = ta.valuewhen(not na(pl), low, 1)
+        
+        if not na(hh) and not na(prevhh) and not na(ll) and not na(prevll)
+            if hh > prevhh and ll > prevll
+                trendDir := "Bullish"
+            else if hh < prevhh and ll < prevll
+                trendDir := "Bearish"
+        swl := ll
+    
+    // Enhanced Resistance
+    [res_level, is_ath, pullback, res_type] = getResistance()
+    
+    // Indicators
+    [macdLine, signalLine, _] = ta.macd(close, 12, 26, 9)
+    macd = macdLine > signalLine ? "Bullish" : "Bearish"
+    rsi_val = ta.rsi(close, 14)
+    vol_sma = ta.sma(volume, 20)
+    volspk = volume > vol_sma * 1.5 ? "Yes" : "No"
+    atr_val = ta.atr(14)
+    atr_sma = ta.sma(atr_val, 14)
+    atr_str = atr_val > atr_sma ? "Yes" : "No"
+    
+    // Enhanced Breakout detection (using weighted res, prefer zoned/ATH)
+    highest_high = ta.highest(high, 20)
+    recent_breakout = not na(res_level) and highest_high >= res_level
+    highest_vol = ta.highest(volume, 20)
+    vol_recent_spike = highest_vol > vol_sma * 1.2
+    momentum_confirm = macd == "Bullish" and rsi_val > 50
+    breakout_strength = is_ath ? "ATH" : res_type
+    confirmed_breakout = recent_breakout and vol_recent_spike and momentum_confirm and atr_str == "Yes"
+    
+    // Retest detection
+    tolerance = tolerance_pct / 100
+    retest = confirmed_breakout and not na(swl) and low <= swl * (1 + tolerance) and close > swl and multiple_bounce
+    retest_str = retest ? "Yes" : "No"
+    
+    // Entry price
+    entry_price = retest ? close : swl
+    
+    [trendDir, entry_price, swl, retest_str, macd, rsi_val, atr_str, volspk, res_level, breakout_strength, pullback]
+
+//==============================================================
+// [5] CURRENT TIMEFRAME COMPUTATION
+//==============================================================
+[trendC, entryC, supC, retestC, macdC, rsiC, atrC, volC, resC, breakStrC, pullC] = getAll(swings_input)
+
+// Plots for levels
+plot(supC, "Support Level", color=color.new(color.blue, 0), linewidth=1)
+plot(resC, "Resistance Zone", color=color.new(color.orange, 0), linewidth=2)
+plotshape(breakStrC == "ATH", title="ATH Resistance", location=location.abovebar, color=color.new(color.purple, 0), style=shape.diamond, size=size.tiny)
+plotshape(pullC, title="Pullback After Res", location=location.belowbar, color=color.new(color.yellow, 0), style=shape.circle, size=size.tiny)
+
+//==============================================================
+// [6] MULTI-TIMEFRAME REQUESTS
+//==============================================================
+[trend4, entry4, sup4, retest4, macd_4h, rsi_4h, atr_4h, vol_4h, res4, breakStr4, pull4] = request.security(syminfo.tickerid, "240", getAll(3))
+[trendD, entryD, supD, retestD, macd_1d, rsi_1d, atr_1d, vol_1d, resD, breakStrD, pullD] = request.security(syminfo.tickerid, "D", getAll(3))
+[trendW, entryW, supW, retestW, macd_1w, rsi_1w, atr_1w, vol_1w, resW, breakStrW, pullW] = request.security(syminfo.tickerid, "W", getAll(5, true))
+[trendM, entryM, supM, retestM, macd_1m, rsi_1m, atr_1m, vol_1m, resM, breakStrM, pullM] = request.security(syminfo.tickerid, "1M", getAll(7, true))
+
+//==============================================================
+// [7] ENTRY CONDITIONS
+//==============================================================
+bull_count = 0
+bull_count += trend4 == "Bullish" ? 1 : 0
+bull_count += trendD == "Bullish" ? 1 : 0
+bull_count += trendW == "Bullish" ? 1 : 0
+bull_count += trendM == "Bullish" ? 1 : 0
+htf_aligned = bull_count >= 2
+
+long_entry = retestC == "Yes" and htf_aligned and trendC != "Bearish" and volC == "Yes" and macdC == "Bullish" and close > sma150
+
+sl_price = na(supC) ? na : supC * 0.999
+risk_actual = na(sl_price) ? na : (close - sl_price) / close * 100
+long_signal = long_entry and not na(risk_actual) and risk_actual <= risk_pct
+
+plotshape(long_signal, title="Long Signal", location=location.belowbar, color=color.green, style=shape.triangleup, text="LONG", textcolor=color.white, size=size.small)
+
+if long_signal and showLabels
+    label_text = "Long Entry\nEntry: " + str.tostring(close, "#.##") + "\nSL: " + str.tostring(sl_price, "#.##") + "\nRisk: " + str.tostring(risk_actual, "#.##") + "%\nRes Type: " + breakStrC
+    label.new(bar_index, low, text=label_text, color=color.new(color.green, 0), style=label.style_label_up, yloc=yloc.belowbar, textcolor=color.white, size=size.normal)
+
+//==============================================================
+// [8] TABLE CREATION (Enhanced with Resistance Info)
+//==============================================================
+var table mtfTable = na
+
+if barstate.islastconfirmedhistory
+    if not na(mtfTable)
+        table.delete(mtfTable)
+    
+    mtfTable := table.new(position.top_right, 11, 6, bgcolor=color.new(color.blue, 70), frame_width=2, frame_color=color.white)
+    
+    // Header
+    table.cell(mtfTable, 0, 0, "TF", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 1, 0, "Trend", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 2, 0, "Entry", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 3, 0, "Sup", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 4, 0, "Retest", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 5, 0, "MACD", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 6, 0, "RSI", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 7, 0, "ATR", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 8, 0, "Vol", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 9, 0, "Res", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    table.cell(mtfTable, 10, 0, "Break/Pull", text_color=color.white, bgcolor=color.new(color.blue, 0))
+    
+    // Current
+    trend_colorC = trendC == "Bullish" ? color.lime : trendC == "Bearish" ? color.red : color.yellow
+    retest_colorC = retestC == "Yes" ? color.lime : color.gray
+    macd_colorC = macdC == "Bullish" ? color.lime : color.red
+    rsi_colorC = rsiC > 50 ? color.lime : color.red
+    atr_colorC = atrC == "Yes" ? color.lime : color.gray
+    vol_colorC = volC == "Yes" ? color.lime : color.gray
+    res_colorC = not na(resC) ? color.orange : color.gray
+    break_colorC = pullC ? color.yellow : breakStrC == "ATH" ? color.purple : color.gray
+    
+    table.cell(mtfTable, 0, 1, "Current", text_color=color.white)
+    table.cell(mtfTable, 1, 1, trendC, text_color=trend_colorC)
+    table.cell(mtfTable, 2, 1, str.tostring(entryC, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 1, str.tostring(supC, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 4, 1, retestC, text_color=retest_colorC)
+    table.cell(mtfTable, 5, 1, macdC, text_color=macd_colorC)
+    table.cell(mtfTable, 6, 1, str.tostring(rsiC, "#"), text_color=rsi_colorC)
+    table.cell(mtfTable, 7, 1, atrC, text_color=atr_colorC)
+    table.cell(mtfTable, 8, 1, volC, text_color=vol_colorC)
+    table.cell(mtfTable, 9, 1, str.tostring(resC, "#.##"), text_color=res_colorC)
+    table.cell(mtfTable, 10, 1, breakStrC + (pullC ? "/Pull" : ""), text_color=break_colorC)
+    
+    // 4H (similar coloring for others)
+    trend_color4 = trend4 == "Bullish" ? color.lime : trend4 == "Bearish" ? color.red : color.yellow
+    retest_color4 = retest4 == "Yes" ? color.lime : color.gray
+    macd_color4 = macd_4h == "Bullish" ? color.lime : color.red
+    rsi_color4 = rsi_4h > 50 ? color.lime : color.red
+    atr_color4 = atr_4h == "Yes" ? color.lime : color.gray
+    vol_color4 = vol_4h == "Yes" ? color.lime : color.gray
+    res_color4 = not na(res4) ? color.orange : color.gray
+    break_color4 = pull4 ? color.yellow : breakStr4 == "ATH" ? color.purple : color.gray
+    
+    table.cell(mtfTable, 0, 2, "4H", text_color=color.white)
+    table.cell(mtfTable, 1, 2, trend4, text_color=trend_color4)
+    table.cell(mtfTable, 2, 2, str.tostring(entry4, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 2, str.tostring(sup4, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 4, 2, retest4, text_color=retest_color4)
+    table.cell(mtfTable, 5, 2, macd_4h, text_color=macd_color4)
+    table.cell(mtfTable, 6, 2, str.tostring(rsi_4h, "#"), text_color=rsi_color4)
+    table.cell(mtfTable, 7, 2, atr_4h, text_color=atr_color4)
+    table.cell(mtfTable, 8, 2, vol_4h, text_color=vol_color4)
+    table.cell(mtfTable, 9, 2, str.tostring(res4, "#.##"), text_color=res_color4)
+    table.cell(mtfTable, 10, 2, breakStr4 + (pull4 ? "/Pull" : ""), text_color=break_color4)
+    
+    // 1D
+    trend_colorD = trendD == "Bullish" ? color.lime : trendD == "Bearish" ? color.red : color.yellow
+    retest_colorD = retestD == "Yes" ? color.lime : color.gray
+    macd_colorD = macd_1d == "Bullish" ? color.lime : color.red
+    rsi_colorD = rsi_1d > 50 ? color.lime : color.red
+    atr_colorD = atr_1d == "Yes" ? color.lime : color.gray
+    vol_colorD = vol_1d == "Yes" ? color.lime : color.gray
+    res_colorD = not na(resD) ? color.orange : color.gray
+    break_colorD = pullD ? color.yellow : breakStrD == "ATH" ? color.purple : color.gray
+    
+    table.cell(mtfTable, 0, 3, "1D", text_color=color.white)
+    table.cell(mtfTable, 1, 3, trendD, text_color=trend_colorD)
+    table.cell(mtfTable, 2, 3, str.tostring(entryD, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 3, str.tostring(supD, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 4, 3, retestD, text_color=retest_colorD)
+    table.cell(mtfTable, 5, 3, macd_1d, text_color=macd_colorD)
+    table.cell(mtfTable, 6, 3, str.tostring(rsi_1d, "#"), text_color=rsi_colorD)
+    table.cell(mtfTable, 7, 3, atr_1d, text_color=atr_colorD)
+    table.cell(mtfTable, 8, 3, vol_1d, text_color=vol_colorD)
+    table.cell(mtfTable, 9, 3, str.tostring(resD, "#.##"), text_color=res_colorD)
+    table.cell(mtfTable, 10, 3, breakStrD + (pullD ? "/Pull" : ""), text_color=break_colorD)
+    
+    // 1W
+    trend_colorW = trendW == "Bullish" ? color.lime : trendW == "Bearish" ? color.red : color.yellow
+    retest_colorW = retestW == "Yes" ? color.lime : color.gray
+    macd_colorW = macd_1w == "Bullish" ? color.lime : color.red
+    rsi_colorW = rsi_1w > 50 ? color.lime : color.red
+    atr_colorW = atr_1w == "Yes" ? color.lime : color.gray
+    vol_colorW = vol_1w == "Yes" ? color.lime : color.gray
+    res_colorW = not na(resW) ? color.orange : color.gray
+    break_colorW = pullW ? color.yellow : breakStrW == "ATH" ? color.purple : color.gray
+    
+    table.cell(mtfTable, 0, 4, "1W", text_color=color.white)
+    table.cell(mtfTable, 1, 4, trendW, text_color=trend_colorW)
+    table.cell(mtfTable, 2, 4, str.tostring(entryW, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 4, str.tostring(supW, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 4, 4, retestW, text_color=retest_colorW)
+    table.cell(mtfTable, 5, 4, macd_1w, text_color=macd_colorW)
+    table.cell(mtfTable, 6, 4, str.tostring(rsi_1w, "#"), text_color=rsi_colorW)
+    table.cell(mtfTable, 7, 4, atr_1w, text_color=atr_colorW)
+    table.cell(mtfTable, 8, 4, vol_1w, text_color=vol_colorW)
+    table.cell(mtfTable, 9, 4, str.tostring(resW, "#.##"), text_color=res_colorW)
+    table.cell(mtfTable, 10, 4, breakStrW + (pullW ? "/Pull" : ""), text_color=break_colorW)
+    
+    // 1M
+    trend_colorM = trendM == "Bullish" ? color.lime : trendM == "Bearish" ? color.red : color.yellow
+    retest_colorM = retestM == "Yes" ? color.lime : color.gray
+    macd_colorM = macd_1m == "Bullish" ? color.lime : color.red
+    rsi_colorM = rsi_1m > 50 ? color.lime : color.red
+    atr_colorM = atr_1m == "Yes" ? color.lime : color.gray
+    vol_colorM = vol_1m == "Yes" ? color.lime : color.gray
+    res_colorM = not na(resM) ? color.orange : color.gray
+    break_colorM = pullM ? color.yellow : breakStrM == "ATH" ? color.purple : color.gray
+    
+    table.cell(mtfTable, 0, 5, "1M", text_color=color.white)
+    table.cell(mtfTable, 1, 5, trendM, text_color=trend_colorM)
+    table.cell(mtfTable, 2, 5, str.tostring(entryM, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 3, 5, str.tostring(supM, "#.##"), text_color=color.white)
+    table.cell(mtfTable, 4, 5, retestM, text_color=retest_colorM)
+    table.cell(mtfTable, 5, 5, macd_1m, text_color=macd_colorM)
+    table.cell(mtfTable, 6, 5, str.tostring(rsi_1m, "#"), text_color=rsi_colorM)
+    table.cell(mtfTable, 7, 5, atr_1m, text_color=atr_colorM)
+    table.cell(mtfTable, 8, 5, vol_1m, text_color=vol_colorM)
+    table.cell(mtfTable, 9, 5, str.tostring(resM, "#.##"), text_color=res_colorM)
+    table.cell(mtfTable, 10, 5, breakStrM + (pullM ? "/Pull" : ""), text_color=break_colorM)
