@@ -1,0 +1,126 @@
+// @version=5
+strategy("ATR Dip Buy with Hold & Quick Exit", 
+     overlay=true, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=10, 
+     pyramiding=1,
+     dynamic_requests=true)
+
+// ---------- Inputs ---------------------------------------------------------
+start_date = input.time(timestamp("2020-01-01T00:00:00"), "Start date")
+end_date   = input.time(timestamp("2026-12-31T23:59:59"), "End date")
+
+// Timeframe for daily ATR (buy signal)
+atr_tf = input.timeframe(title="Daily ATR timeframe", defval="1D")
+buy_atr_len = input.int(14, "Buy ATR length", minval=1)
+buy_drop_mult = input.float(1.5, "Buy if daily drop >= ATR ×", minval=0.1, step=0.1)
+
+// Sell up from entry
+sell_up_atr_len = input.int(14, "Sell-up ATR length", minval=1)
+sell_up_mult = input.float(3.0, "Sell if up >= ATR × from entry", minval=0.1, step=0.1)
+min_hold_days = input.int(3, "Min hold days for sell-up", minval=1)
+
+// Quick sell on drop
+quick_drop_mult = input.float(0.5, "Quick sell if drop >= ATR × in window", minval=0.1, step=0.1)
+drop_window_hours = input.int(2, "Drop window (hours)", minval=1)
+quick_atr_len = input.int(14, "Quick ATR length (intraday)", minval=1)
+vol_ma_len = input.int(20, "Avg volume length", minval=1)
+vol_threshold_mult = input.float(1.0, "Volume >= avg ×", minval=0.1, step=0.1)
+
+// Execution mode (immediate for buy, as per rule)
+include_extended = input.bool(false, "Include extended hours")
+
+// Date/time filter
+in_date_range = (time >= start_date) and (time <= end_date)
+regular_session = not na(time(timeframe.period, "0930-1600"))
+can_trade = in_date_range and (include_extended or regular_session)
+
+// Daily data for buy signal
+daily_open = request.security(syminfo.tickerid, atr_tf, open, lookahead=barmerge.lookahead_off)
+daily_high = request.security(syminfo.tickerid, atr_tf, high, lookahead=barmerge.lookahead_off)
+daily_low = request.security(syminfo.tickerid, atr_tf, low, lookahead=barmerge.lookahead_off)
+daily_close = request.security(syminfo.tickerid, atr_tf, close, lookahead=barmerge.lookahead_off)
+daily_atr = request.security(syminfo.tickerid, atr_tf, ta.atr(buy_atr_len), lookahead=barmerge.lookahead_off)
+
+// Buy condition: daily low <= prev daily close - buy_drop_mult * daily_atr
+prev_daily_close = daily_close[1]
+daily_drop = prev_daily_close - daily_low
+buy_condition = daily_drop >= buy_drop_mult * daily_atr and can_trade and strategy.position_size == 0
+
+// Vars for position management
+var int entry_bar = 0
+var float entry_price = na
+var float entry_atr = na  // For sell-up ATR
+var float recent_high = na  // For quick drop detection
+
+// Enter on buy condition (immediate)
+if buy_condition
+    strategy.entry("Long", strategy.long, comment="Buy Dip")
+    entry_bar := bar_index
+    entry_price := close
+    entry_atr := request.security(syminfo.tickerid, atr_tf, ta.atr(sell_up_atr_len), lookahead=barmerge.lookahead_off)
+    recent_high := high
+
+// Update recent_high every bar while in position
+if strategy.position_size > 0
+    recent_high := math.max(recent_high, high)
+
+// Days held (approx, using bar_index)
+bars_held = bar_index - entry_bar
+days_held = math.floor(bars_held / (24 * 60 / timeframe.in_seconds(timeframe.period)))  // Rough days estimate
+
+// Sell-up: if held >= min_hold_days and high >= entry + sell_up_mult * entry_atr
+sell_up_condition = strategy.position_size > 0 and days_held >= min_hold_days and high >= entry_price + sell_up_mult * entry_atr and can_trade
+
+// Quick sell: drop from recent_high >= quick_drop_mult * intraday ATR in last N bars (2 hours approx)
+intraday_atr = ta.atr(quick_atr_len)
+bars_in_window = math.round(drop_window_hours * 60 / timeframe.in_seconds(timeframe.period))
+drop_from_high = recent_high - low
+quick_drop_condition = strategy.position_size > 0 and drop_from_high >= quick_drop_mult * intraday_atr and 
+                       ta.barssince(math.max(high, recent_high[1]) == recent_high) <= bars_in_window and  // Drop in window
+                       volume >= ta.sma(volume, vol_ma_len) * vol_threshold_mult and can_trade
+
+// Exits
+if sell_up_condition
+    strategy.close("Long", comment="Sell Up")
+if quick_drop_condition
+    strategy.close("Long", comment="Quick Sell")
+
+// Optional fixed SL/TP (disabled by default)
+use_fixed_stop = input.bool(false, "Enable fixed stop-loss %")
+stop_pct = input.float(3.0, "Stop-loss %", step=0.1) / 100.0
+use_fixed_take = input.bool(false, "Enable fixed take-profit %")
+take_pct = input.float(6.0, "Take-profit %", step=0.1) / 100.0
+
+if use_fixed_stop or use_fixed_take
+    if strategy.position_size > 0
+        avg = strategy.position_avg_price
+        stop_price = use_fixed_stop ? avg * (1 - stop_pct) : na
+        limit_price = use_fixed_take ? avg * (1 + take_pct) : na
+        strategy.exit("FixedExit", stop=stop_price, limit=limit_price)
+
+// Plots
+plot(prev_daily_close - buy_drop_mult * daily_atr, "Buy Threshold", color=color.new(color.green, 60), linewidth=1)
+plot(strategy.position_size > 0 ? entry_price + sell_up_mult * entry_atr : na, "Sell-Up Target", color=color.new(color.red, 60), linewidth=1)
+plot(daily_close, "Daily Close", color=color.new(color.blue, 70), linewidth=1)
+
+// Labels
+if buy_condition and barstate.isconfirmed
+    label.new(bar_index, low, "BUY\n" + str.tostring(close, "#.##"), yloc=yloc.belowbar, style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+if sell_up_condition and barstate.isconfirmed
+    label.new(bar_index, high, "SELL UP\n" + str.tostring(high, "#.##"), yloc=yloc.abovebar, style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+if quick_drop_condition and barstate.isconfirmed
+    label.new(bar_index, low, "QUICK SELL\n" + str.tostring(low, "#.##"), yloc=yloc.belowbar, style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)
+
+// Info box
+var label info = na
+if barstate.islast
+    label.delete(info)
+    info := label.new(bar_index, high, 
+         text="Buy Drop: " + str.tostring(buy_drop_mult) + "×ATR\n" +
+              "Sell Up: " + str.tostring(sell_up_mult) + "×ATR after " + str.tostring(min_hold_days) + " days\n" +
+              "Quick Drop: " + str.tostring(quick_drop_mult) + "×ATR in " + str.tostring(drop_window_hours) + "h, Vol≥" + str.tostring(vol_threshold_mult) + "×Avg\n" +
+              (strategy.position_size > 0 ? "Held: " + str.tostring(days_held) + " days\nEntry: " + str.tostring(entry_price, "#.##") : ""),
+         yloc=yloc.abovebar, style=label.style_label_left, color=color.new(color.gray,90), textcolor=color.white, size=size.small)
